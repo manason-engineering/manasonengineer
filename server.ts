@@ -447,7 +447,7 @@ if (aiApiKey) {
 }
 
 // Utility to create/save notifications/alerts
-function triggerServerDispatch(db: DatabaseSchema, type: 'WhatsApp' | 'SMS' | 'Email' | 'Platform', recipient: string, content: string) {
+function triggerServerDispatch(db: DatabaseSchema, type: 'WhatsApp' | 'SMS' | 'Email' | 'Platform', recipient: string, content: string, fallbackEmail?: string) {
   const newDispatch = {
     id: `disp-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
     type,
@@ -468,6 +468,11 @@ function triggerServerDispatch(db: DatabaseSchema, type: 'WhatsApp' | 'SMS' | 'E
   } else if (type === 'WhatsApp') {
     sendRealWhatsApp(recipient, content).catch(err =>
       console.warn('WhatsApp send failed:', err?.message || err)
+    );
+  } else if (type === 'SMS' && fallbackEmail && fallbackEmail.includes('@')) {
+    // No SMS gateway is configured — send the same notification by email instead.
+    sendRealEmail(fallbackEmail, 'MANASON ENGINEERING', content).catch(err =>
+      console.warn('Resend email (SMS fallback) send failed:', err?.message || err)
     );
   }
 
@@ -523,8 +528,15 @@ async function sendRealWhatsApp(toPhoneRaw: string, message: string) {
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
   if (!token || !phoneNumberId) return; // Simulation mode — not verified with Meta yet.
 
-  // WhatsApp Cloud API requires E.164 format without the leading '+'.
-  const toPhone = toPhoneRaw.replace(/[^\d]/g, '');
+  // WhatsApp Cloud API requires full E.164 digits (with country code, no '+').
+  // Numbers stored locally are often just the national number (e.g. "0785647676"),
+  // so normalize Rwandan numbers by adding the 250 country code when missing.
+  let toPhone = toPhoneRaw.replace(/[^\d]/g, '');
+  if (toPhone.startsWith('0') && toPhone.length === 10) {
+    toPhone = '250' + toPhone.slice(1);
+  } else if (toPhone.length === 9) {
+    toPhone = '250' + toPhone;
+  }
   if (!toPhone) return;
 
   const res = await fetch(`https://graph.facebook.com/v20.0/${phoneNumberId}/messages`, {
@@ -676,7 +688,7 @@ app.post('/api/auth/register', (req, res) => {
   db.users.push(newUser);
   triggerServerDispatch(db, 'Platform', newUser.name, `Welcome to Manason Engineering! Profile registered.`);
   triggerServerDispatch(db, 'Email', newUser.email, `Hello ${newUser.name}, welcome to MANASON ENGINEERING, Rwanda's Complete Construction Marketplace.`);
-  triggerServerDispatch(db, 'SMS', newUser.phone, `Welcome to Manason Engineering! Login anytime with your credentials.`);
+  triggerServerDispatch(db, 'SMS', newUser.phone, `Welcome to Manason Engineering! Login anytime with your credentials.`, newUser.email);
 
   writeDB(db);
   logAction(newUser.id, newUser.name, 'Register', `User registered as ${newUser.type}.`);
@@ -704,7 +716,7 @@ app.post('/api/admin/verify-user', requireAdminSession, (req, res) => {
   if (userIndex !== -1) {
     db.users[userIndex].isVerified = true;
     triggerServerDispatch(db, 'Platform', db.users[userIndex].name, `Your technical credentials have been verified by Manason Admin.`);
-    triggerServerDispatch(db, 'SMS', db.users[userIndex].phone, `CONGRATULATIONS: Manason Admin reviewed and verified your license and profile.`);
+    triggerServerDispatch(db, 'SMS', db.users[userIndex].phone, `CONGRATULATIONS: Manason Admin reviewed and verified your license and profile.`, db.users[userIndex].email);
     writeDB(db);
     return res.json({ success: true, user: db.users[userIndex] });
   }
@@ -787,7 +799,7 @@ app.post('/api/admin/reply-quote', requireAdminSession, (req, res) => {
     
     const client = db.users.find(u => u.id === q.clientId);
     if (client) {
-      triggerServerDispatch(db, 'SMS', client.phone, `MANASON QUOTE: Your request for "${q.productName}" was answered with custom rate: ${price.toLocaleString()} RWF.`);
+      triggerServerDispatch(db, 'SMS', client.phone, `MANASON QUOTE: Your request for "${q.productName}" was answered with custom rate: ${price.toLocaleString()} RWF.`, client.email);
     }
 
     writeDB(db);
@@ -891,12 +903,12 @@ app.post('/api/jobs/update-status', (req, res) => {
     if (worker) {
       const trackingLink = `${req.protocol}://${req.get('host')}/?trackJob=${job.id}`;
       triggerServerDispatch(db, 'WhatsApp', worker.phone, `ESCROW SECURED: Client ${job.clientName} deposited funds for "${job.title}". You are authorized to begin travelling/working now! Open this link on your phone to share your live GPS location with the client and admin: ${trackingLink}`);
-      triggerServerDispatch(db, 'SMS', worker.phone, `MANASON: Escrow secured for "${job.title}". Share your live location: ${trackingLink}`);
+      triggerServerDispatch(db, 'SMS', worker.phone, `MANASON: Escrow secured for "${job.title}". Share your live location: ${trackingLink}`, worker.email);
     }
   } else if (status === 'travelling') {
     triggerServerDispatch(db, 'Platform', job.clientName, `Worker ${job.workerName} is travelling to your site.`);
     if (client) {
-      triggerServerDispatch(db, 'SMS', client.phone, `MANASON TRACKING: Specialist ${job.workerName} is now traveling to your location.`);
+      triggerServerDispatch(db, 'SMS', client.phone, `MANASON TRACKING: Specialist ${job.workerName} is now traveling to your location.`, client.email);
     }
   } else if (status === 'arrived') {
     triggerServerDispatch(db, 'Platform', job.clientName, `Worker ${job.workerName} has arrived at the site.`);
@@ -909,14 +921,14 @@ app.post('/api/jobs/update-status', (req, res) => {
     triggerServerDispatch(db, 'Platform', 'Admin', `Worker ${job.workerName} completed job "${job.title}". Awaiting client approval.`);
     if (client) {
       triggerServerDispatch(db, 'Email', client.email, `Dear ${client.name}, the specialist ${job.workerName} marked your project "${job.title}" as completed. Please inspect and approve to release payment.`);
-      triggerServerDispatch(db, 'SMS', client.phone, `MANASON COMPLETED: "${job.title}" marked done. Please login to review work and approve release.`);
+      triggerServerDispatch(db, 'SMS', client.phone, `MANASON COMPLETED: "${job.title}" marked done. Please login to review work and approve release.`, client.email);
     }
   } else if (status === 'client_approved') {
     triggerServerDispatch(db, 'Platform', 'Admin', `ACTION NEEDED: Client ${job.clientName} confirmed "${job.title}" is complete. Please review the worker's photo/video reports in the Escrow Ledger before releasing payment.`);
   } else if (status === 'approved') {
     triggerServerDispatch(db, 'Platform', 'Admin', `Client approved job "${job.title}". Autoreleasing ${Math.round(job.price * 0.9).toLocaleString()} RWF to worker (10% platform commission retained).`);
     if (worker) {
-      triggerServerDispatch(db, 'SMS', worker.phone, `PAYMENT RELEASED: Admin released ${Math.round(job.price * 0.9).toLocaleString()} RWF to your wallet for "${job.title}". Thank you for working with Manason.`);
+      triggerServerDispatch(db, 'SMS', worker.phone, `PAYMENT RELEASED: Admin released ${Math.round(job.price * 0.9).toLocaleString()} RWF to your wallet for "${job.title}". Thank you for working with Manason.`, worker.email);
     }
   } else if (status === 'disputed') {
     triggerServerDispatch(db, 'Platform', 'Admin', `CRITICAL: Client filed a dispute regarding job "${job.title}". Dispute investigation opened.`);
@@ -1212,12 +1224,12 @@ app.post('/api/admin/resolve-dispute', requireAdminSession, (req, res) => {
     if (action === 'release') {
       triggerServerDispatch(db, 'Platform', 'System', `ADMIN RESOLUTION: Admin approved full payment release for "${job.title}" after investigation.`);
       if (worker) {
-        triggerServerDispatch(db, 'SMS', worker.phone, `MANASON DISPUTE RESOLVED: Admin completed escrow audit and released payment of ${Math.round(job.price * 0.9).toLocaleString()} RWF to your wallet.`);
+        triggerServerDispatch(db, 'SMS', worker.phone, `MANASON DISPUTE RESOLVED: Admin completed escrow audit and released payment of ${Math.round(job.price * 0.9).toLocaleString()} RWF to your wallet.`, worker.email);
       }
     } else {
       triggerServerDispatch(db, 'Platform', 'System', `ADMIN RESOLUTION: Admin authorized full escrow refund of ${job.price.toLocaleString()} RWF back to client ${job.clientName}.`);
       if (client) {
-        triggerServerDispatch(db, 'SMS', client.phone, `MANASON DISPUTE RESOLVED: Admin completed escrow audit and refunded your ${job.price.toLocaleString()} RWF fully.`);
+        triggerServerDispatch(db, 'SMS', client.phone, `MANASON DISPUTE RESOLVED: Admin completed escrow audit and refunded your ${job.price.toLocaleString()} RWF fully.`, client.email);
       }
     }
 
@@ -1721,367 +1733,4 @@ app.put('/api/advertisements/:id', requireAdminSession, (req, res) => {
       imageUrl: imageUrl || db.advertisements[index].imageUrl,
       contactInfo: contactInfo || db.advertisements[index].contactInfo,
       status: status || db.advertisements[index].status,
-      isMadeInRwanda: isMadeInRwanda !== undefined ? !!isMadeInRwanda : db.advertisements[index].isMadeInRwanda
-    };
-    writeDB(db);
-    logAction('admin', 'Admin', 'Update Ad', `Updated advertisement ${id} status: ${status || 'edited'}`);
-    return res.json({ success: true, advertisement: db.advertisements[index] });
-  }
-  return res.status(404).json({ error: 'Advertisement not found' });
-});
-
-// Delete Advertisement (Admin)
-app.delete('/api/advertisements/:id', requireAdminSession, (req, res) => {
-  const { id } = req.params;
-  const db = readDB();
-  db.advertisements = db.advertisements || [];
-  const index = db.advertisements.findIndex(ad => ad.id === id);
-  if (index !== -1) {
-    const deleted = db.advertisements.splice(index, 1)[0];
-    writeDB(db);
-    logAction('admin', 'Admin', 'Delete Ad', `Deleted advertisement: "${deleted.title}"`);
-    return res.json({ success: true, advertisement: deleted });
-  }
-  return res.status(404).json({ error: 'Advertisement not found' });
-});
-
-// Get Audit Logs (Admin)
-app.get('/api/audit-logs', requireAdminSession, (req, res) => {
-  const db = readDB();
-  res.json(db.auditLogs || []);
-});
-
-// Clear Audit Logs (Admin)
-app.post('/api/admin/audit-logs/clear', requireAdminSession, (req, res) => {
-  const db = readDB();
-  db.auditLogs = [
-    {
-      id: `audit-${Date.now()}`,
-      userId: 'u-admin',
-      userName: 'Manason Admin',
-      action: 'Clear Logs',
-      timestamp: new Date().toISOString(),
-      details: 'Admin cleared previous system logs.'
-    }
-  ];
-  writeDB(db);
-  res.json({ success: true, auditLogs: db.auditLogs });
-});
-
-// File Upload Handler (PDF, JPEG, PNG)
-app.post('/api/upload', async (req, res) => {
-  const { fileName, fileType, fileData } = req.body;
-  if (!fileName || !fileData) {
-    return res.status(400).json({ error: 'Missing file name or data.' });
-  }
-
-  const allowedExtensions = ['.pdf', '.png', '.jpg', '.jpeg', '.mp4', '.mov', '.webm'];
-  const videoExtensions = ['.mp4', '.mov', '.webm'];
-  const ext = path.extname(fileName).toLowerCase();
-  if (!allowedExtensions.includes(ext)) {
-    return res.status(400).json({ error: 'Invalid file type. Only PDF, PNG, JPG, JPEG, MP4, MOV, and WEBM are allowed.' });
-  }
-
-  try {
-    const base64Data = fileData.replace(/^data:.*?;base64,/, '');
-    const buffer = Buffer.from(base64Data, 'base64');
-
-    const maxSize = videoExtensions.includes(ext) ? 50 * 1024 * 1024 : 10 * 1024 * 1024;
-    if (buffer.length > maxSize) {
-      const maxSizeLabel = videoExtensions.includes(ext) ? '50MB' : '10MB';
-      return res.status(400).json({ error: `File size exceeds the ${maxSizeLabel} security limit.` });
-    }
-
-    const safeFileName = `${Date.now()}-${fileName.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
-
-    // Prefer Supabase Storage when configured — this is REQUIRED for
-    // uploads (worker IDs, certificates, etc.) to survive server restarts,
-    // since Render's free-tier disk is ephemeral and wipes on every restart.
-    if (supabase) {
-      const { error: uploadError } = await supabase
-        .storage
-        .from('manason-uploads')
-        .upload(safeFileName, buffer, {
-          contentType: fileType || 'application/octet-stream',
-          upsert: false
-        });
-
-      if (!uploadError) {
-        const { data: publicUrlData } = supabase
-          .storage
-          .from('manason-uploads')
-          .getPublicUrl(safeFileName);
-        return res.json({
-          success: true,
-          url: publicUrlData.publicUrl,
-          size: `${(buffer.length / (1024 * 1024)).toFixed(1)} MB`
-        });
-      }
-      console.warn('Supabase Storage upload failed, falling back to local disk (NOT persistent on restarts):', uploadError);
-    }
-
-    // Fallback: local disk. Only used when Supabase Storage isn't configured
-    // or its upload failed — files here are lost on the next server restart.
-    const uploadsDir = path.join(process.cwd(), 'uploads');
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
-    }
-    const filePath = path.join(uploadsDir, safeFileName);
-    fs.writeFileSync(filePath, buffer);
-    const fileUrl = `/uploads/${safeFileName}`;
-    res.json({ success: true, url: fileUrl, size: `${(buffer.length / (1024 * 1024)).toFixed(1)} MB` });
-  } catch (error: any) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: 'Server error during upload.' });
-  }
-});
-
-// Disaster Recovery (Backup & Restore)
-app.post('/api/admin/backup/create', requireAdminSession, (req, res) => {
-  try {
-    const db = readDB();
-    const backupDir = path.join(process.cwd(), 'backups');
-    if (!fs.existsSync(backupDir)) {
-      fs.mkdirSync(backupDir, { recursive: true });
-    }
-    const backupFile = `db-backup-${Date.now()}.json`;
-    fs.writeFileSync(path.join(backupDir, backupFile), JSON.stringify(db, null, 2), 'utf-8');
-    logAction('admin', 'Admin', 'Create Backup', `Created backup point: ${backupFile}`);
-    res.json({ success: true, file: backupFile });
-  } catch (err: any) {
-    res.status(500).json({ error: 'Failed to create backup.', details: err.message });
-  }
-});
-
-app.get('/api/admin/backups', requireAdminSession, (req, res) => {
-  try {
-    const backupDir = path.join(process.cwd(), 'backups');
-    if (!fs.existsSync(backupDir)) {
-      fs.mkdirSync(backupDir, { recursive: true });
-    }
-    const files = fs.readdirSync(backupDir)
-      .filter(f => f.startsWith('db-backup-') && f.endsWith('.json'))
-      .map(f => {
-        const stats = fs.statSync(path.join(backupDir, f));
-        return {
-          fileName: f,
-          size: `${(stats.size / 1024).toFixed(1)} KB`,
-          createdAt: stats.mtime.toISOString()
-        };
-      });
-    res.json(files);
-  } catch (err: any) {
-    res.status(500).json({ error: 'Failed to list backups.' });
-  }
-});
-
-app.post('/api/admin/backup/restore', requireAdminSession, (req, res) => {
-  const { fileName } = req.body;
-  if (!fileName) return res.status(400).json({ error: 'Backup file name required.' });
-  try {
-    const backupDir = path.join(process.cwd(), 'backups');
-    const filePath = path.join(backupDir, fileName);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'Backup file not found.' });
-    }
-    const data = fs.readFileSync(filePath, 'utf-8');
-    const parsed = JSON.parse(data);
-    
-    // Simple verification
-    if (!parsed.users || !parsed.products) {
-      return res.status(400).json({ error: 'Invalid backup database schema.' });
-    }
-    
-    writeDB(parsed);
-    logAction('admin', 'Admin', 'Restore Backup', `Restored system from backup: ${fileName}`);
-    res.json({ success: true });
-  } catch (err: any) {
-    res.status(500).json({ error: 'Failed to restore database.' });
-  }
-});
-
-app.post('/api/admin/backup/download-json', requireAdminSession, (req, res) => {
-  const db = readDB();
-  res.json({ jsonString: JSON.stringify(db, null, 2) });
-});
-
-app.post('/api/admin/backup/upload-json', requireAdminSession, (req, res) => {
-  const { jsonString } = req.body;
-  if (!jsonString) return res.status(400).json({ error: 'JSON content required.' });
-  try {
-    const parsed = JSON.parse(jsonString);
-    if (!parsed.users || !parsed.products) {
-      return res.status(400).json({ error: 'Invalid database JSON file.' });
-    }
-    writeDB(parsed);
-    logAction('admin', 'Admin', 'Upload DB JSON', 'Overwrote database via JSON file upload.');
-    res.json({ success: true });
-  } catch (err: any) {
-    res.status(400).json({ error: 'Invalid JSON syntax.' });
-  }
-});
-
-// ==========================================
-// PROJECTS MANAGEMENT (ADMIN & CLIENTS)
-// ==========================================
-
-// Get Projects List
-app.get('/api/projects', (req, res) => {
-  const db = readDB();
-  res.json(db.projects || []);
-});
-
-// Add Project (Admin)
-app.post('/api/projects', requireAdminSession, (req, res) => {
-  const { title, category, contractor, description, imageUrl } = req.body;
-  if (!title) {
-    return res.status(400).json({ error: 'Project title is required.' });
-  }
-  const db = readDB();
-  const newProject = {
-    id: `proj-${Date.now()}`,
-    title,
-    category: category || 'GENERAL',
-    contractor: contractor || 'Manason Contractor',
-    description: description || 'No details provided.',
-    imageUrl: imageUrl || 'https://images.unsplash.com/photo-1590069261209-f8e9b8642343?w=400&auto=format&fit=crop&q=80'
-  };
-  db.projects = db.projects || [];
-  db.projects.push(newProject);
-  writeDB(db);
-  res.json({ success: true, project: newProject });
-});
-
-// Edit Project (Admin)
-app.put('/api/projects/:id', requireAdminSession, (req, res) => {
-  const { id } = req.params;
-  const { title, category, contractor, description, imageUrl } = req.body;
-  const db = readDB();
-  db.projects = db.projects || [];
-  const index = db.projects.findIndex(p => p.id === id);
-  if (index !== -1) {
-    db.projects[index] = {
-      ...db.projects[index],
-      title: title || db.projects[index].title,
-      category: category || db.projects[index].category,
-      contractor: contractor || db.projects[index].contractor,
-      description: description || db.projects[index].description,
-      imageUrl: imageUrl || db.projects[index].imageUrl
-    };
-    writeDB(db);
-    return res.json({ success: true, project: db.projects[index] });
-  }
-  return res.status(404).json({ error: 'Project not found' });
-});
-
-// Delete Project (Admin)
-app.delete('/api/projects/:id', requireAdminSession, (req, res) => {
-  const { id } = req.params;
-  const db = readDB();
-  db.projects = db.projects || [];
-  const index = db.projects.findIndex(p => p.id === id);
-  if (index !== -1) {
-    const deletedProject = db.projects.splice(index, 1)[0];
-    writeDB(db);
-    return res.json({ success: true, project: deletedProject });
-  }
-  return res.status(404).json({ error: 'Project not found' });
-});
-
-// ==========================================
-// CONSULTANCY UPDATES (ADMIN & EXPERTS)
-// ==========================================
-
-// Update / Reply to Consultancy
-app.put('/api/consultancy/:id', requireAdminSession, (req, res) => {
-  const { id } = req.params;
-  const { status, assignedExpert, reply } = req.body;
-  const db = readDB();
-  const index = db.consultancies.findIndex(c => c.id === id);
-  if (index !== -1) {
-    const con = db.consultancies[index];
-    if (status) con.status = status;
-    if (assignedExpert) con.assignedExpert = assignedExpert;
-    if (reply) {
-      con.reply = reply;
-      con.status = 'assigned';
-      triggerServerDispatch(db, 'Email', con.email, `MANASON ADVISORY REPLY: Our assigned expert, ${assignedExpert || 'Chief Engineer'}, responded to your brief: "${reply}".`);
-      triggerServerDispatch(db, 'SMS', con.phone, `MANASON ADVISORY: Vetted expert assigned. Reply details sent to your registered email/phone.`);
-    }
-    writeDB(db);
-    return res.json({ success: true, consultancy: con });
-  }
-  return res.status(404).json({ error: 'Consultancy request not found' });
-});
-
-// ==========================================
-// AI CONSULTANT (GEMINI INTEGRATION)
-// ==========================================
-app.post('/api/ai/feasibility-analysis', async (req, res) => {
-  const { projectType, details, budget, location } = req.body;
-  if (!projectType || !details) {
-    return res.status(400).json({ error: 'Project type and details are required for AI analysis.' });
-  }
-
-  if (!aiClient) {
-    return res.json({
-      aiAnalysis: `### **Manason AI Feasibility Report (Offline Sandbox)**\n\n*Note: To enable live Gemini AI-powered analysis, please configure the 'GEMINI_API_KEY' environment variable.*\n\n#### **1. Structural Feasibility**\nThe described project **"${projectType}"** located at **"${location || 'Kigali Area'}"** appears structurally standard. For hilly Rwandan terrain, a reinforced masonry or volcanic stone retaining wall is highly recommended to protect foundations against storm runoff erosion.\n\n#### **2. Construction Permitting (Rwanda Building Code)**\nUnder the Rwanda Building Code, any new construction or significant renovation requires a permit from the local District One-Stop Centre (e.g., Gasabo, Kicukiro, Nyarugenge). You will need:\n- Valid Land Title (Ubutaka)\n- Feasibility / Topographic Survey\n- Architectural and Structural Drawings certified by an ERB (Institution of Engineers Rwanda) member.\n\n#### **3. Cost & Material Estimates**\nBased on your specified budget of **${budget || 'flexible'} RWF**, we recommend using:\n- **CIMERWA 32.5N / 42.5R Cement** for masonry and concrete works respectively.\n- **Ruliba Clays** for high-quality sustainable brickwork and roof tiles.\n- **Ameki Color Paints** for exterior weather-guard coatings.\n\n#### **4. Local Specialist Recommendations**\nWe suggest browsing the Workers Directory for a **Technical** Masonry specialist or a registered **Construction Company** like *Kigali Builders Ltd* to submit a complete Bill of Quantities (BoQ).`
-    });
-  }
-
-  try {
-    const prompt = `You are the chief engineering advisory AI for "Manason Engineering Ltd", a premiere construction platform in Rwanda.
-Generate a structured, professional, and thorough feasibility report based on the client's project proposal. 
-
-Project Parameters:
-- Project Type: ${projectType}
-- Description: ${details}
-- Client Budget: ${budget || 'Flexible'}
-- Proposed Location in Rwanda: ${location || 'Kigali, Rwanda'}
-
-Provide the response in beautiful, structured Markdown. Include these exact sections:
-1. **Introduction & Summary**: Briefly restate and assess the client's proposal.
-2. **Structural Feasibility**: Discuss foundation details, slope and terrain safety (especially relevant to Rwanda's hilly landscape, terracing, retaining walls), and structural recommendations.
-3. **Rwandan Building Code & Permitting**: Explain the regulatory steps (One-Stop Centre permissions, Land Titles/Ubutaka, and certified ERB engineer signature requirements).
-4. **Local Materials & Manufacturer Recommendations**: Explicitly suggest specific local brands like CIMERWA Cement, Ruliba Clays, or Ameki Color Paints to match their scope.
-5. **Contractor & Next Step Recommendations**: Give advice on hiring from our verified professionals, drawing up a Bill of Quantities (BoQ), and depositing funds into the Manason secure Escrow ledger before commencing works.
-
-Write in a highly authoritative, helpful, and professional engineering consultant tone. Keep it concise but dense with practical local building advice.`;
-
-    const response = await aiClient.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-    });
-
-    res.json({ aiAnalysis: response.text });
-  } catch (error: any) {
-    console.error('Gemini AI API Call failed:', error);
-    res.status(500).json({ error: 'Failed to generate AI advisory. Please try again.', details: error.message });
-  }
-});
-
-
-// ==========================================
-// VITE OR STATIC FILE SERVING FOR FULL-STACK
-// ==========================================
-async function startViteServer() {
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[FULL-STACK] Manason Server running at http://0.0.0.0:${PORT}`);
-  });
-}
-
-restoreDBFromSupabase().then(() => startViteServer());
+      isMadeInRwanda: isMadeInRwanda !== undefined ? !!

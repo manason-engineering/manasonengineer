@@ -784,7 +784,10 @@ export default function Dashboard() {
                   <p className="text-xs text-slate-400 italic">No contract agreements are registered on the platform.</p>
                 ) : (
                   <div className="space-y-4">
-                    {jobs.map(job => (
+                    {[...jobs].sort((a, b) => {
+                      const rank = (s: typeof a.status) => s === JobStatus.APPROVED ? 1 : 0;
+                      return rank(a.status) - rank(b.status);
+                    }).map(job => (
                       <div key={job.id} className="p-4 rounded-xl border border-slate-200 flex flex-col justify-between gap-4">
                         <div className="flex justify-between items-start flex-wrap gap-2">
                           <div>
@@ -895,9 +898,10 @@ export default function Dashboard() {
                               <div className="space-y-2 max-h-48 overflow-y-auto pr-1 mb-3">
                                 {job.progressUpdates.map(pu => (
                                   <div key={pu.id} className="p-2 rounded-lg bg-white border border-purple-100 text-xxs flex gap-2">
-                                    {pu.videoUrl ? (
+                                    {pu.videoUrl && (
                                       <video src={pu.videoUrl} controls className="w-20 h-12 rounded object-cover shrink-0 bg-black" />
-                                    ) : pu.imageUrl && (
+                                    )}
+                                    {pu.imageUrl && (
                                       <img src={pu.imageUrl} className="w-12 h-12 rounded object-cover shrink-0 bg-slate-100" />
                                     )}
                                     <div>
@@ -1856,9 +1860,10 @@ export default function Dashboard() {
                                 <div className="space-y-3 max-h-40 overflow-y-auto pr-2">
                                   {job.progressUpdates.map(pu => (
                                     <div key={pu.id} className="p-2.5 rounded-lg bg-white border border-slate-200 text-xs flex gap-2">
-                                      {pu.videoUrl ? (
+                                      {pu.videoUrl && (
                                         <video src={pu.videoUrl} controls className="w-16 h-10 rounded object-cover shrink-0 bg-black" />
-                                      ) : pu.imageUrl && (
+                                      )}
+                                      {pu.imageUrl && (
                                         <img src={pu.imageUrl} className="w-10 h-10 rounded object-cover shrink-0 bg-slate-100" />
                                       )}
                                       <div>

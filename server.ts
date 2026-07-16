@@ -559,6 +559,167 @@ async function sendRealWhatsApp(toPhoneRaw: string, message: string) {
 }
 
 // ==========================================
+// MTN MOMO COLLECTION API (REAL PAYMENTS)
+// ==========================================
+// Docs: https://momodeveloper.mtn.com
+// Sandbox and production use the same endpoints; only the base URL and
+// the subscription key's approved environment differ.
+const MOMO_SUBSCRIPTION_KEY = process.env.MOMO_SUBSCRIPTION_KEY;
+const MOMO_API_USER = process.env.MOMO_API_USER;
+const MOMO_API_KEY = process.env.MOMO_API_KEY;
+const MOMO_TARGET_ENVIRONMENT = process.env.MOMO_TARGET_ENVIRONMENT || 'sandbox';
+const MOMO_CALLBACK_HOST = process.env.MOMO_CALLBACK_HOST || 'https://manason-engineer.onrender.com';
+const MOMO_BASE_URL = MOMO_TARGET_ENVIRONMENT === 'sandbox'
+  ? 'https://sandbox.momodeveloper.mtn.com'
+  : 'https://momodeveloper.mtn.com';
+
+// One-time setup: creates a sandbox API user + API key. Only works against
+// the sandbox base URL. Run this ONCE, then copy the returned apiUser/apiKey
+// into MOMO_API_USER / MOMO_API_KEY on Render — after that this endpoint is
+// no longer needed for sandbox testing.
+app.get('/api/momo/setup-sandbox', async (req, res) => {
+  if (MOMO_API_USER && MOMO_API_KEY) {
+    return res.status(400).json({ error: 'Already configured — MOMO_API_USER and MOMO_API_KEY are already set on the server.' });
+  }
+  if (MOMO_TARGET_ENVIRONMENT !== 'sandbox') {
+    return res.status(400).json({ error: 'Setup only runs against sandbox. Set MOMO_TARGET_ENVIRONMENT=sandbox first.' });
+  }
+  if (!MOMO_SUBSCRIPTION_KEY) {
+    return res.status(400).json({ error: 'MOMO_SUBSCRIPTION_KEY is not set on the server.' });
+  }
+  try {
+    const referenceId = crypto.randomUUID();
+    const userRes = await fetch(`${MOMO_BASE_URL}/v1_0/apiuser`, {
+      method: 'POST',
+      headers: {
+        'X-Reference-Id': referenceId,
+        'Ocp-Apim-Subscription-Key': MOMO_SUBSCRIPTION_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ providerCallbackHost: MOMO_CALLBACK_HOST })
+    });
+    if (!userRes.ok) {
+      const t = await userRes.text();
+      return res.status(500).json({ error: `Failed to create API user: ${userRes.status} ${t}` });
+    }
+
+    const keyRes = await fetch(`${MOMO_BASE_URL}/v1_0/apiuser/${referenceId}/apikey`, {
+      method: 'POST',
+      headers: { 'Ocp-Apim-Subscription-Key': MOMO_SUBSCRIPTION_KEY }
+    });
+    if (!keyRes.ok) {
+      const t = await keyRes.text();
+      return res.status(500).json({ error: `Failed to create API key: ${keyRes.status} ${t}` });
+    }
+    const keyData = await keyRes.json();
+
+    res.json({
+      message: 'Success! Copy these two values into Render Environment Variables as MOMO_API_USER and MOMO_API_KEY, then Save Changes.',
+      MOMO_API_USER: referenceId,
+      MOMO_API_KEY: keyData.apiKey
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+async function getMomoAccessToken(): Promise<string> {
+  if (!MOMO_SUBSCRIPTION_KEY || !MOMO_API_USER || !MOMO_API_KEY) {
+    throw new Error('MoMo is not configured yet (missing MOMO_SUBSCRIPTION_KEY / MOMO_API_USER / MOMO_API_KEY).');
+  }
+  const basicAuth = Buffer.from(`${MOMO_API_USER}:${MOMO_API_KEY}`).toString('base64');
+  const tokenRes = await fetch(`${MOMO_BASE_URL}/collection/token/`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${basicAuth}`,
+      'Ocp-Apim-Subscription-Key': MOMO_SUBSCRIPTION_KEY
+    }
+  });
+  if (!tokenRes.ok) {
+    const t = await tokenRes.text();
+    throw new Error(`MoMo token error (${tokenRes.status}): ${t}`);
+  }
+  const data = await tokenRes.json();
+  return data.access_token;
+}
+
+// Starts a real Request-to-Pay push to the client's phone.
+app.post('/api/momo/request-to-pay', (req, res) => {
+  (async () => {
+    const { jobId, phone, amount } = req.body;
+    if (!jobId || !phone || !amount) {
+      return res.status(400).json({ error: 'jobId, phone, and amount are required.' });
+    }
+    try {
+      const accessToken = await getMomoAccessToken();
+      const referenceId = crypto.randomUUID();
+      let momoPhone = String(phone).replace(/[^\d]/g, '');
+      if (momoPhone.startsWith('0') && momoPhone.length === 10) momoPhone = '250' + momoPhone.slice(1);
+      else if (momoPhone.length === 9) momoPhone = '250' + momoPhone;
+
+      const payRes = await fetch(`${MOMO_BASE_URL}/collection/v1_0/requesttopay`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'X-Reference-Id': referenceId,
+          'X-Target-Environment': MOMO_TARGET_ENVIRONMENT,
+          'Ocp-Apim-Subscription-Key': MOMO_SUBSCRIPTION_KEY!,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          amount: String(amount),
+          currency: MOMO_TARGET_ENVIRONMENT === 'sandbox' ? 'EUR' : 'RWF',
+          externalId: jobId,
+          payer: { partyIdType: 'MSISDN', partyId: momoPhone },
+          payerMessage: 'Manason Engineering - Escrow Payment',
+          payeeNote: `Job ${jobId}`
+        })
+      });
+      if (!payRes.ok) {
+        const t = await payRes.text();
+        return res.status(500).json({ error: `Request to Pay failed (${payRes.status}): ${t}` });
+      }
+      res.json({ referenceId, status: 'pending' });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  })();
+});
+
+// Polls a Request-to-Pay status, and marks the job's escrow as deposited on success.
+app.get('/api/momo/status/:referenceId', (req, res) => {
+  (async () => {
+    try {
+      const accessToken = await getMomoAccessToken();
+      const statusRes = await fetch(`${MOMO_BASE_URL}/collection/v1_0/requesttopay/${req.params.referenceId}`, {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'X-Target-Environment': MOMO_TARGET_ENVIRONMENT,
+          'Ocp-Apim-Subscription-Key': MOMO_SUBSCRIPTION_KEY!
+        }
+      });
+      if (!statusRes.ok) {
+        const t = await statusRes.text();
+        return res.status(500).json({ error: `Status check failed (${statusRes.status}): ${t}` });
+      }
+      const data = await statusRes.json();
+      const jobId = data.externalId;
+      if (data.status === 'SUCCESSFUL' && jobId) {
+        const db = readDB();
+        const job = db.jobs.find(j => j.id === jobId);
+        if (job && job.status !== 'escrow_deposited') {
+          job.status = 'escrow_deposited';
+          writeDB(db);
+        }
+      }
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  })();
+});
+
+// ==========================================
 // API ROUTES
 // ==========================================
 
@@ -2097,4 +2258,3 @@ async function startViteServer() {
 }
 
 restoreDBFromSupabase().then(() => startViteServer());
-

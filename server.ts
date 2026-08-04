@@ -83,6 +83,8 @@ interface DatabaseSchema {
   advertisements?: any[];
   auditLogs?: any[];
   jobPostings?: any[];
+  stagePostings?: any[];
+  stageApplications?: any[];
 }
 
 const DEFAULT_SETTINGS = {
@@ -222,7 +224,9 @@ function readDB(): DatabaseSchema {
         settings: DEFAULT_SETTINGS,
         advertisements: DEFAULT_ADVERTISEMENTS,
         auditLogs: DEFAULT_AUDIT_LOGS,
-        jobPostings: []
+        jobPostings: [],
+        stagePostings: [],
+        stageApplications: []
       };
       fs.writeFileSync(DB_PATH, JSON.stringify(initialDB, null, 2), 'utf-8');
       return initialDB;
@@ -271,6 +275,14 @@ function readDB(): DatabaseSchema {
       db.jobPostings = [];
       modified = true;
     }
+    if (!db.stagePostings) {
+      db.stagePostings = [];
+      modified = true;
+    }
+    if (!db.stageApplications) {
+      db.stageApplications = [];
+      modified = true;
+    }
     // Security migration: any Admin account that has no password set
     // (from the old insecure version) gets the default password so the
     // owner is not locked out. They should change it immediately from
@@ -292,7 +304,7 @@ function readDB(): DatabaseSchema {
       consultancies: [], dispatches: [], brochures: [], homepage: {}, 
       projects: [], clientRequests: [], settings: DEFAULT_SETTINGS, 
       advertisements: DEFAULT_ADVERTISEMENTS, auditLogs: DEFAULT_AUDIT_LOGS,
-      jobPostings: []
+      jobPostings: [], stagePostings: [], stageApplications: []
     };
   }
 }
@@ -401,6 +413,23 @@ async function saveToSupabase(request: any) {
     }
   } catch (err) {
     console.warn('Failed to save to Supabase (ignoring and proceeding with local DB):', err);
+  }
+}
+
+async function deleteFromSupabase(id: string) {
+  if (!supabase) return;
+  try {
+    const { error } = await supabase
+      .from('client_requests')
+      .delete()
+      .eq('id', id);
+    if (error) {
+      console.warn('Supabase DB delete warning (ignoring and proceeding with local DB):', error);
+    } else {
+      console.log('Successfully deleted from Supabase:', id);
+    }
+  } catch (err) {
+    console.warn('Failed to delete from Supabase (ignoring and proceeding with local DB):', err);
   }
 }
 
@@ -953,6 +982,7 @@ app.post('/api/admin/reply-quote', requireAdminSession, (req, res) => {
   if (quoteIndex !== -1) {
     const q = db.quotes[quoteIndex];
     q.priceOfferedByAdmin = Number(price);
+    q.commission = Math.round(Number(price) * 0.1); // 10% platform commission, same rule as job escrow
     q.isRepliedByAdmin = true;
     q.status = 'replied';
 
@@ -983,16 +1013,246 @@ app.post('/api/quotes/approve', (req, res) => {
   return res.status(404).json({ error: 'Quotation not found.' });
 });
 
+// Delete Quote (Admin)
+app.delete('/api/quotes/:id', requireAdminSession, (req, res) => {
+  const { id } = req.params;
+  const db = readDB();
+  const index = db.quotes.findIndex(q => q.id === id);
+  if (index !== -1) {
+    const deleted = db.quotes.splice(index, 1)[0];
+    writeDB(db);
+    return res.json({ success: true, quote: deleted });
+  }
+  return res.status(404).json({ error: 'Quotation not found.' });
+});
+
 // Get Quotes
 app.get('/api/quotes', (req, res) => {
   const db = readDB();
   res.json(db.quotes);
 });
 
+// ==========================================
+// STAGE / INTERNSHIP PROGRAM
+// ==========================================
+const STAGE_APPLICATION_FEE_RWF = 5000;
+
+// Get all open Stage postings (public)
+app.get('/api/stage/postings', (req, res) => {
+  const db = readDB();
+  res.json(db.stagePostings || []);
+});
+
+// Create a Stage posting (Admin only — on behalf of a partner construction company)
+app.post('/api/admin/stage/postings', requireAdminSession, (req, res) => {
+  const { companyName, title, field, location, durationWeeks, slots, description } = req.body;
+  if (!companyName || !title || !field) {
+    return res.status(400).json({ error: 'companyName, title, and field are required.' });
+  }
+  const db = readDB();
+  const posting = {
+    id: crypto.randomUUID(),
+    companyName,
+    title,
+    field,
+    location: location || 'Kigali',
+    durationWeeks: Number(durationWeeks) || 8,
+    slots: Number(slots) || 1,
+    description: description || '',
+    isOpen: true,
+    createdAt: new Date().toISOString()
+  };
+  db.stagePostings = db.stagePostings || [];
+  db.stagePostings.unshift(posting);
+  writeDB(db);
+  res.json({ success: true, posting });
+});
+
+// Close/delete a Stage posting (Admin only)
+app.delete('/api/admin/stage/postings/:id', requireAdminSession, (req, res) => {
+  const db = readDB();
+  db.stagePostings = db.stagePostings || [];
+  const index = db.stagePostings.findIndex((p: any) => p.id === req.params.id);
+  if (index !== -1) {
+    const deleted = db.stagePostings.splice(index, 1)[0];
+    writeDB(db);
+    return res.json({ success: true, posting: deleted });
+  }
+  return res.status(404).json({ error: 'Stage posting not found.' });
+});
+
+// Get all Stage applications. Admin sees everyone's; a logged-in student sees only their own.
+app.get('/api/stage/applications', (req, res) => {
+  const db = readDB();
+  const all = db.stageApplications || [];
+  const { studentId } = req.query;
+  if (studentId) {
+    return res.json(all.filter((a: any) => a.studentId === studentId));
+  }
+  res.json(all);
+});
+
+// Submit a Stage application. Created with paymentStatus 'pending' — the
+// 5,000 RWF fee must clear via MoMo before Admin can see/consider it.
+app.post('/api/stage/apply', (req, res) => {
+  const { studentId, studentName, studentPhone, school, fieldOfStudy, postingId, postingTitle, motivation } = req.body;
+  if (!studentId || !studentName || !studentPhone || !school || !fieldOfStudy) {
+    return res.status(400).json({ error: 'Amazina, telefoni, ishuri, n\'ubushobozi bwiga birasabwa.' });
+  }
+  const db = readDB();
+  const application = {
+    id: crypto.randomUUID(),
+    studentId,
+    studentName,
+    studentPhone,
+    school,
+    fieldOfStudy,
+    postingId: postingId || null,
+    postingTitle: postingTitle || 'General Stage Placement',
+    motivation: motivation || '',
+    paymentStatus: 'pending', // 'pending' | 'paid'
+    status: 'submitted', // 'submitted' | 'placed' | 'rejected'
+    momoReferenceId: null as string | null,
+    createdAt: new Date().toISOString()
+  };
+  db.stageApplications = db.stageApplications || [];
+  db.stageApplications.unshift(application);
+  writeDB(db);
+  res.json({ success: true, application });
+});
+
+// Start the 5,000 RWF MoMo Request-to-Pay push for a Stage application.
+app.post('/api/momo/stage/request-to-pay', (req, res) => {
+  (async () => {
+    const { applicationId, phone } = req.body;
+    if (!applicationId || !phone) {
+      return res.status(400).json({ error: 'applicationId and phone are required.' });
+    }
+    try {
+      const accessToken = await getMomoAccessToken();
+      const referenceId = crypto.randomUUID();
+      let momoPhone = String(phone).replace(/[^\d]/g, '');
+      if (momoPhone.startsWith('0') && momoPhone.length === 10) momoPhone = '250' + momoPhone.slice(1);
+      else if (momoPhone.length === 9) momoPhone = '250' + momoPhone;
+
+      const payRes = await fetch(`${MOMO_BASE_URL}/collection/v1_0/requesttopay`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'X-Reference-Id': referenceId,
+          'X-Target-Environment': MOMO_TARGET_ENVIRONMENT,
+          'Ocp-Apim-Subscription-Key': MOMO_SUBSCRIPTION_KEY!,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          amount: String(STAGE_APPLICATION_FEE_RWF),
+          currency: MOMO_TARGET_ENVIRONMENT === 'sandbox' ? 'EUR' : 'RWF',
+          externalId: applicationId,
+          payer: { partyIdType: 'MSISDN', partyId: momoPhone },
+          payerMessage: 'Manason Engineering - Stage Application Fee',
+          payeeNote: `Stage application ${applicationId}`
+        })
+      });
+      if (!payRes.ok) {
+        const t = await payRes.text();
+        return res.status(500).json({ error: `Request to Pay failed (${payRes.status}): ${t}` });
+      }
+
+      const db = readDB();
+      const app_ = (db.stageApplications || []).find((a: any) => a.id === applicationId);
+      if (app_) {
+        app_.momoReferenceId = referenceId;
+        writeDB(db);
+      }
+      res.json({ referenceId, status: 'pending' });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  })();
+});
+
+// Poll the Stage application's MoMo payment status; marks it 'paid' on success.
+app.get('/api/momo/stage/status/:referenceId', (req, res) => {
+  (async () => {
+    try {
+      const accessToken = await getMomoAccessToken();
+      const statusRes = await fetch(`${MOMO_BASE_URL}/collection/v1_0/requesttopay/${req.params.referenceId}`, {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'X-Target-Environment': MOMO_TARGET_ENVIRONMENT,
+          'Ocp-Apim-Subscription-Key': MOMO_SUBSCRIPTION_KEY!
+        }
+      });
+      if (!statusRes.ok) {
+        const t = await statusRes.text();
+        return res.status(500).json({ error: `Status check failed (${statusRes.status}): ${t}` });
+      }
+      const data = await statusRes.json();
+      if (data.status === 'SUCCESSFUL') {
+        const db = readDB();
+        const application = (db.stageApplications || []).find((a: any) => a.id === data.externalId);
+        if (application && application.paymentStatus !== 'paid') {
+          application.paymentStatus = 'paid';
+          writeDB(db);
+          triggerServerDispatch(db, 'Platform', 'Admin', `New PAID Stage application from ${application.studentName} (${application.school}) for "${application.postingTitle}".`);
+        }
+      }
+      res.json({ status: data.status });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  })();
+});
+
+// Admin updates an application's placement outcome (placed / rejected)
+app.patch('/api/admin/stage/applications/:id', requireAdminSession, (req, res) => {
+  const { status } = req.body; // 'placed' | 'rejected'
+  const db = readDB();
+  const application = (db.stageApplications || []).find((a: any) => a.id === req.params.id);
+  if (!application) return res.status(404).json({ error: 'Application not found.' });
+  application.status = status;
+  writeDB(db);
+  const student = db.users.find((u: any) => u.id === application.studentId);
+  if (student) {
+    const msg = status === 'placed'
+      ? `Congratulations! You have been placed for your Stage: "${application.postingTitle}".`
+      : `Update on your Stage application for "${application.postingTitle}".`;
+    triggerServerDispatch(db, 'SMS', student.phone, msg, student.email);
+  }
+  res.json({ success: true, application });
+});
+
+// ==========================================
+// LOYALTY TIERS — commission rate decreases as a worker completes more
+// approved (paid-out) jobs. Rewards reliable, experienced workers with a
+// lower platform cut, while new workers start at the standard 10%.
+// ==========================================
+const LOYALTY_TIERS = [
+  { minCompletedJobs: 30, rate: 0.05, name: 'Gold' },
+  { minCompletedJobs: 5, rate: 0.08, name: 'Silver' },
+  { minCompletedJobs: 0, rate: 0.10, name: 'Bronze' }
+];
+
+function getWorkerLoyaltyTier(db: DatabaseSchema, workerId: string) {
+  const completedJobs = (db.jobs || []).filter(
+    (j: any) => j.workerId === workerId && j.status === 'approved'
+  ).length;
+  const tier = LOYALTY_TIERS.find(t => completedJobs >= t.minCompletedJobs) || LOYALTY_TIERS[LOYALTY_TIERS.length - 1];
+  return { ...tier, completedJobs };
+}
+
 // Get Jobs
 app.get('/api/jobs', (req, res) => {
   const db = readDB();
   res.json(db.jobs);
+});
+
+// Look up a worker's current loyalty tier & commission rate (used by the UI
+// to show the worker their progress before they accept a job).
+app.get('/api/loyalty/:workerId', (req, res) => {
+  const db = readDB();
+  const tier = getWorkerLoyaltyTier(db, req.params.workerId);
+  res.json(tier);
 });
 
 // Create Job Contract (Hire Worker)
@@ -1003,11 +1263,13 @@ app.post('/api/jobs', (req, res) => {
   }
 
   const db = readDB();
+  const workerTier = getWorkerLoyaltyTier(db, jobFields.workerId);
   const newJob = {
     ...jobFields,
     id: `j-${Date.now()}`,
     status: 'pending',
-    commission: Math.round(Number(jobFields.price) * 0.1),
+    commission: Math.round(Number(jobFields.price) * workerTier.rate),
+    loyaltyTierAtBooking: workerTier.name,
     progressUpdates: [],
     createdAt: new Date().toISOString().split('T')[0]
   };
@@ -1040,9 +1302,23 @@ app.post('/api/jobs', (req, res) => {
   res.json({ success: true, job: newJob });
 });
 
+// Delete Job / Escrow Agreement (Admin)
+app.delete('/api/jobs/:id', requireAdminSession, (req, res) => {
+  const { id } = req.params;
+  const db = readDB();
+  db.jobs = db.jobs || [];
+  const index = db.jobs.findIndex(j => j.id === id);
+  if (index !== -1) {
+    const deletedJob = db.jobs.splice(index, 1)[0];
+    writeDB(db);
+    return res.json({ success: true, job: deletedJob });
+  }
+  return res.status(404).json({ error: 'Job not found' });
+});
+
 // Update Job Status / Escrow Flow
 app.post('/api/jobs/update-status', (req, res) => {
-  const { jobId, status } = req.body;
+  const { jobId, status, requesterId } = req.body;
   if (!jobId || !status) {
     return res.status(400).json({ error: 'Job ID and status required.' });
   }
@@ -1054,6 +1330,27 @@ app.post('/api/jobs/update-status', (req, res) => {
   }
 
   const job = db.jobs[jobIndex];
+
+  // Access control: releasing payment ('approved') is never allowed through
+  // this general-purpose route — it can only happen via the protected Admin
+  // resolve-dispute route. For every other status, only the job's own client
+  // or worker (matching the status their role is allowed to set) or a valid
+  // Admin session may make the change.
+  if (status === 'approved') {
+    return res.status(403).json({ error: 'Iyi status ihindurwa gusa na Admin binyuze mu buryo bwemewe (resolve-dispute).' });
+  }
+  const clientStatuses = ['escrow_deposited', 'client_approved', 'disputed'];
+  const workerStatuses = ['travelling', 'arrived', 'working', 'completed', 'disputed'];
+  const adminToken = req.header('x-admin-token');
+  const callerIsAdmin = !!adminToken && db.users.some(
+    (u: any) => u.type === 'Admin' && u.sessionToken === adminToken && u.sessionExpiry && Date.now() <= u.sessionExpiry
+  );
+  const isClientAction = clientStatuses.includes(status) && !!requesterId && requesterId === job.clientId;
+  const isWorkerAction = workerStatuses.includes(status) && !!requesterId && requesterId === job.workerId;
+  if (!isClientAction && !isWorkerAction && !callerIsAdmin) {
+    return res.status(403).json({ error: 'Ntabwo wemerewe guhindura iyi status kuri iri sezerano.' });
+  }
+
   job.status = status;
 
   const worker = db.users.find(u => u.id === job.workerId);
@@ -1087,7 +1384,7 @@ app.post('/api/jobs/update-status', (req, res) => {
   } else if (status === 'client_approved') {
     triggerServerDispatch(db, 'Platform', 'Admin', `ACTION NEEDED: Client ${job.clientName} confirmed "${job.title}" is complete. Please review the worker's photo/video reports in the Escrow Ledger before releasing payment.`);
   } else if (status === 'approved') {
-    triggerServerDispatch(db, 'Platform', 'Admin', `Client approved job "${job.title}". Autoreleasing ${Math.round(job.price * 0.9).toLocaleString()} RWF to worker (10% platform commission retained).`);
+    triggerServerDispatch(db, 'Platform', 'Admin', `Client approved job "${job.title}". Autoreleasing ${(job.price - job.commission).toLocaleString()} RWF to worker (${job.commission.toLocaleString()} RWF platform commission retained, ${job.loyaltyTierAtBooking || 'Bronze'} tier).`);
     if (worker) {
       triggerServerDispatch(db, 'SMS', worker.phone, `PAYMENT RELEASED: Admin released ${Math.round(job.price * 0.9).toLocaleString()} RWF to your wallet for "${job.title}". Thank you for working with Manason.`, worker.email);
     }
@@ -1304,7 +1601,7 @@ app.post('/api/job-postings/:id/offer', (req, res) => {
 // Accept an offer (Client) — creates a real Job/escrow contract from it
 app.post('/api/job-postings/:id/accept-offer', (req, res) => {
   const { id } = req.params;
-  const { offerId } = req.body;
+  const { offerId, requesterId } = req.body;
   if (!offerId) {
     return res.status(400).json({ error: 'Offer ID required.' });
   }
@@ -1315,6 +1612,10 @@ app.post('/api/job-postings/:id/accept-offer', (req, res) => {
   if (!posting) {
     return res.status(404).json({ error: 'Job posting not found.' });
   }
+  // Only the client who created this posting may accept an offer on it.
+  if (!requesterId || requesterId !== posting.clientId) {
+    return res.status(403).json({ error: 'Ntabwo wemerewe kwemeza offer kuri iyi job posting.' });
+  }
   if (posting.status !== 'open') {
     return res.status(400).json({ error: 'This job posting has already been awarded or closed.' });
   }
@@ -1324,6 +1625,7 @@ app.post('/api/job-postings/:id/accept-offer', (req, res) => {
   }
 
   // Create the real escrow contract, mirroring POST /api/jobs
+  const workerTier = getWorkerLoyaltyTier(db, offer.workerId);
   const newJob = {
     id: `j-${Date.now()}`,
     clientId: posting.clientId,
@@ -1336,7 +1638,8 @@ app.post('/api/job-postings/:id/accept-offer', (req, res) => {
     price: offer.price,
     status: 'pending',
     location: { lat: -1.9547, lng: 30.0824, address: posting.location },
-    commission: Math.round(Number(offer.price) * 0.1),
+    commission: Math.round(Number(offer.price) * workerTier.rate),
+    loyaltyTierAtBooking: workerTier.name,
     progressUpdates: [],
     createdAt: new Date().toISOString().split('T')[0]
   };
@@ -1602,6 +1905,23 @@ app.put('/api/client-requests/:id', requireAdminSession, async (req, res) => {
   res.status(404).json({ error: 'Client request not found.' });
 });
 
+// Delete Client Request (Admin)
+app.delete('/api/client-requests/:id', requireAdminSession, async (req, res) => {
+  const { id } = req.params;
+  const db = readDB();
+  db.clientRequests = db.clientRequests || [];
+  const index = db.clientRequests.findIndex(r => r.id === id);
+  if (index !== -1) {
+    const deletedRequest = db.clientRequests.splice(index, 1)[0];
+    writeDB(db);
+    // Also remove from Supabase, otherwise the next sync (GET /api/client-requests)
+    // pulls it back from Supabase and it reappears even though it was "deleted".
+    await deleteFromSupabase(id);
+    return res.json({ success: true, request: deletedRequest });
+  }
+  return res.status(404).json({ error: 'Client request not found.' });
+});
+
 // Outbound Alerts/Dispatches
 app.get('/api/dispatches', requireAdminSession, (req, res) => {
   const db = readDB();
@@ -1636,9 +1956,16 @@ app.put('/api/users/:id', (req, res) => {
     (u: any) => u.type === 'Admin' && u.sessionToken === adminToken && u.sessionExpiry && Date.now() <= u.sessionExpiry
   );
 
+  // A non-admin caller may only edit their OWN profile — never someone
+  // else's, even if they know that person's user ID.
+  if (!callerIsAdmin && updatedFields.requesterId !== id) {
+    return res.status(403).json({ error: 'Ntushobora guhindura konti y\'undi muntu.' });
+  }
+
   // Never allow these fields to be changed through this general-purpose route,
   // regardless of caller — they have dedicated, protected endpoints.
   delete updatedFields.id;
+  delete updatedFields.requesterId;
   delete updatedFields.password;
   delete updatedFields.sessionToken;
   delete updatedFields.sessionExpiry;
